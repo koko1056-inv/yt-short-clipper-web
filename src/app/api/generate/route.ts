@@ -1,4 +1,5 @@
 import { NextRequest, NextResponse } from "next/server";
+import Anthropic from "@anthropic-ai/sdk";
 
 interface GenerateRequest {
   url: string;
@@ -31,29 +32,94 @@ function extractVideoId(url: string): string | null {
   return null;
 }
 
-const CLIP_TITLES: Record<string, string[]> = {
-  highlights: [
-    "Most Engaging Moment",
-    "Peak Emotional Point",
-    "Key Insight",
-    "Viral-Worthy Segment",
-    "High Energy Moment",
-  ],
-  intro: [
-    "Perfect Hook Opening",
-    "Attention-Grabbing Intro",
-    "Strong Opening Statement",
-    "First Impression Clip",
-    "Opening Power Move",
-  ],
-  outro: [
-    "Powerful Closing Statement",
-    "Call-to-Action Moment",
-    "Memorable Ending",
-    "Final Key Takeaway",
-    "Closing Impact Clip",
-  ],
-};
+function parseIsoDuration(iso: string): number {
+  const match = iso.match(/PT(?:(\d+)H)?(?:(\d+)M)?(?:(\d+)S)?/);
+  if (!match) return 600;
+  const h = parseInt(match[1] || "0");
+  const m = parseInt(match[2] || "0");
+  const s = parseInt(match[3] || "0");
+  return h * 3600 + m * 60 + s;
+}
+
+async function fetchYouTubeDetails(videoId: string) {
+  const apiKey = process.env.YOUTUBE_API_KEY;
+  const url = `https://www.googleapis.com/youtube/v3/videos?id=${videoId}&part=snippet,contentDetails&key=${apiKey}`;
+  const res = await fetch(url);
+  const data = await res.json();
+  if (!data.items || data.items.length === 0) return null;
+  const item = data.items[0];
+  return {
+    title: item.snippet.title as string,
+    description: item.snippet.description as string,
+    duration: parseIsoDuration(item.contentDetails.duration),
+    channelTitle: item.snippet.channelTitle as string,
+  };
+}
+
+async function analyzeWithClaude(
+  videoTitle: string,
+  description: string,
+  duration: number,
+  clipLength: number,
+  clipCount: number,
+  style: string
+): Promise<Clip[]> {
+  const client = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
+
+  const prompt = `You are an expert video content analyst specializing in creating viral short-form clips for TikTok, Instagram Reels, and YouTube Shorts.
+
+Video Info:
+- Title: ${videoTitle}
+- Duration: ${duration} seconds (${Math.floor(duration / 60)}m ${duration % 60}s)
+- Description/Chapters: ${description.slice(0, 2000)}
+
+Task: Identify the ${clipCount} best ${clipLength}-second clips for "${style}" style.
+
+Style definitions:
+- highlights: Most engaging/emotional/surprising moments
+- intro: Strong hooks that grab attention in first 3 seconds  
+- outro: Calls-to-action or memorable closing moments
+
+For each clip, provide:
+1. Start time (in seconds from video start)
+2. A catchy clip title (max 8 words)
+3. Virality score (0.0-1.0)
+
+Respond ONLY with valid JSON array, no markdown:
+[
+  {"startTime": 45, "title": "Mind-Blowing Revelation Changes Everything", "score": 0.97},
+  ...
+]
+
+Rules:
+- Spread clips throughout the video
+- No overlap between clips (each clip is ${clipLength}s long)
+- Don't exceed video duration (${duration}s)
+- Higher scores for more engaging moments`;
+
+  const response = await client.messages.create({
+    model: "claude-3-5-haiku-20241022",
+    max_tokens: 1024,
+    messages: [{ role: "user", content: prompt }],
+  });
+
+  const text = response.content[0].type === "text" ? response.content[0].text : "[]";
+  
+  try {
+    const parsed = JSON.parse(text);
+    const videoId = ""; // will be set by caller
+    return parsed.slice(0, clipCount).map((item: { startTime: number; title: string; score: number }, i: number) => ({
+      id: `clip-${i + 1}`,
+      startTime: Math.max(0, Math.min(item.startTime, duration - clipLength)),
+      endTime: Math.max(0, Math.min(item.startTime, duration - clipLength)) + clipLength,
+      thumbnailUrl: `https://img.youtube.com/vi/${videoId}/hqdefault.jpg`,
+      title: item.title,
+      score: item.score,
+    }));
+  } catch {
+    return [];
+  }
+}
 
 export async function POST(request: NextRequest) {
   try {
@@ -66,40 +132,40 @@ export async function POST(request: NextRequest) {
 
     const videoId = extractVideoId(url);
     if (!videoId) {
-      return NextResponse.json(
-        { error: "Invalid YouTube URL" },
-        { status: 400 }
-      );
+      return NextResponse.json({ error: "Invalid YouTube URL" }, { status: 400 });
     }
 
-    // Simulate processing delay
-    await new Promise((resolve) => setTimeout(resolve, 2000));
+    // Fetch real YouTube video info
+    const videoDetails = await fetchYouTubeDetails(videoId);
+    if (!videoDetails) {
+      return NextResponse.json({ error: "Could not fetch video details" }, { status: 404 });
+    }
 
-    const titles = CLIP_TITLES[style] || CLIP_TITLES.highlights;
-    const videoDuration = 600; // Assume 10 min video
+    const { title, description, duration } = videoDetails;
 
-    const clips: Clip[] = Array.from({ length: clipCount }, (_, i) => {
-      const maxStart = videoDuration - clipLength;
-      const startTime = Math.floor(
-        (maxStart / (clipCount + 1)) * (i + 1) + Math.random() * 20 - 10
-      );
-      const clampedStart = Math.max(0, Math.min(startTime, maxStart));
-
-      return {
-        id: `clip-${i + 1}`,
-        startTime: clampedStart,
-        endTime: clampedStart + clipLength,
-        thumbnailUrl: `https://img.youtube.com/vi/${videoId}/hqdefault.jpg`,
-        title: `${titles[i % titles.length]} #${i + 1}`,
-        score: parseFloat((0.98 - i * 0.05 + Math.random() * 0.03).toFixed(2)),
-      };
-    });
-
-    return NextResponse.json(clips);
-  } catch {
-    return NextResponse.json(
-      { error: "Failed to process request" },
-      { status: 500 }
+    // Use Claude AI to analyze and find best clips
+    const clips = await analyzeWithClaude(
+      title,
+      description,
+      duration,
+      clipLength,
+      clipCount,
+      style
     );
+
+    // Inject real thumbnails
+    const clipsWithThumbnails = clips.map((clip) => ({
+      ...clip,
+      thumbnailUrl: `https://img.youtube.com/vi/${videoId}/hqdefault.jpg`,
+    }));
+
+    return NextResponse.json({
+      videoTitle: title,
+      videoDuration: duration,
+      clips: clipsWithThumbnails,
+    });
+  } catch (err) {
+    console.error("Generate error:", err);
+    return NextResponse.json({ error: "Failed to process request" }, { status: 500 });
   }
 }
