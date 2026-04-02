@@ -106,17 +106,24 @@ Rules:
   const text = response.content[0].type === "text" ? response.content[0].text : "[]";
   
   try {
-    const parsed = JSON.parse(text);
-    const videoId = ""; // will be set by caller
-    return parsed.slice(0, clipCount).map((item: { startTime: number; title: string; score: number }, i: number) => ({
-      id: `clip-${i + 1}`,
-      startTime: Math.max(0, Math.min(item.startTime, duration - clipLength)),
-      endTime: Math.max(0, Math.min(item.startTime, duration - clipLength)) + clipLength,
-      thumbnailUrl: `https://img.youtube.com/vi/${videoId}/hqdefault.jpg`,
-      title: item.title,
-      score: item.score,
-    }));
-  } catch {
+    // Extract JSON from response (Claude sometimes wraps in markdown)
+    const jsonMatch = text.match(/\[[\s\S]*\]/);
+    const jsonStr = jsonMatch ? jsonMatch[0] : text;
+    const parsed = JSON.parse(jsonStr);
+    console.log("Claude parsed successfully:", parsed.length, "clips");
+    return parsed.slice(0, clipCount).map((item: { startTime: number; title: string; score: number }, i: number) => {
+      const start = Math.max(0, Math.min(Number(item.startTime), duration - clipLength));
+      return {
+        id: `clip-${i + 1}`,
+        startTime: start,
+        endTime: start + clipLength,
+        thumbnailUrl: "",
+        title: item.title || `Clip #${i + 1}`,
+        score: item.score || 0.85,
+      };
+    });
+  } catch (e) {
+    console.error("Claude JSON parse failed. Raw:", text.slice(0, 200), "Error:", e);
     return [];
   }
 }
